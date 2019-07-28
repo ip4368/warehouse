@@ -37,11 +37,14 @@ from warehouse.email import (
     send_primary_email_change_email,
     send_project_role_verification_email,
 )
+from warehouse.macaroons.interfaces import IMacaroonService
 from warehouse.manage.forms import (
     AddEmailForm,
     ChangePasswordForm,
     ChangeRoleForm,
+    CreateMacaroonForm,
     CreateRoleForm,
+    DeleteMacaroonForm,
     DeleteTOTPForm,
     DeleteWebAuthnForm,
     ProvisionTOTPForm,
@@ -49,6 +52,7 @@ from warehouse.manage.forms import (
     SaveAccountForm,
 )
 from warehouse.packaging.models import File, JournalEntry, Project, Release, Role
+from warehouse.utils.http import is_safe_url
 from warehouse.utils.paginate import paginate_url_factory
 from warehouse.utils.project import confirm_project, destroy_docs, remove_project
 
@@ -334,7 +338,7 @@ class ProvisionTOTPViews:
 
     @view_config(route_name="manage.account.totp-provision.image", request_method="GET")
     def generate_totp_qr(self):
-        if not self.request.user.two_factor_provisioning_allowed:
+        if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
@@ -352,7 +356,7 @@ class ProvisionTOTPViews:
 
     @view_config(request_method="GET")
     def totp_provision(self):
-        if not self.request.user.two_factor_provisioning_allowed:
+        if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
@@ -371,7 +375,7 @@ class ProvisionTOTPViews:
 
     @view_config(request_method="POST", request_param=ProvisionTOTPForm.__params__)
     def validate_totp_provision(self):
-        if not self.request.user.two_factor_provisioning_allowed:
+        if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
@@ -406,7 +410,7 @@ class ProvisionTOTPViews:
 
     @view_config(request_method="POST", request_param=DeleteTOTPForm.__params__)
     def delete_totp(self):
-        if not self.request.user.two_factor_provisioning_allowed:
+        if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
@@ -536,6 +540,91 @@ class ProvisionWebAuthnViews:
             self.request.session.flash("Invalid credentials", queue="error")
 
         return HTTPSeeOther(self.request.route_path("manage.account"))
+
+
+@view_defaults(
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:user",
+    renderer="manage/token.html",
+    route_name="manage.account.token",
+)
+class ProvisionMacaroonViews:
+    def __init__(self, request):
+        self.request = request
+        self.user_service = request.find_service(IUserService, context=None)
+        self.macaroon_service = request.find_service(IMacaroonService, context=None)
+
+    @property
+    def project_names(self):
+        projects = user_projects(self.request)["projects_owned"]
+        return [project.name for project in projects]
+
+    @property
+    def default_response(self):
+        return {
+            "project_names": self.project_names,
+            "create_macaroon_form": CreateMacaroonForm(
+                user_id=self.request.user.id,
+                macaroon_service=self.macaroon_service,
+                project_names=self.project_names,
+            ),
+            "delete_macaroon_form": DeleteMacaroonForm(
+                macaroon_service=self.macaroon_service
+            ),
+        }
+
+    @view_config(request_method="GET")
+    def manage_macaroons(self):
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=CreateMacaroonForm.__params__)
+    def create_macaroon(self):
+        if not self.request.user.has_primary_verified_email:
+            self.request.session.flash(
+                "Verify your email to create an API token.", queue="error"
+            )
+            return HTTPSeeOther(self.request.route_path("manage.account"))
+
+        form = CreateMacaroonForm(
+            **self.request.POST,
+            user_id=self.request.user.id,
+            macaroon_service=self.macaroon_service,
+            project_names=self.project_names,
+        )
+
+        response = {**self.default_response}
+        if form.validate():
+            serialized_macaroon, macaroon = self.macaroon_service.create_macaroon(
+                location=self.request.domain,
+                user_id=self.request.user.id,
+                description=form.description.data,
+                caveats={"permissions": form.validated_scope, "version": 1},
+            )
+            response.update(serialized_macaroon=serialized_macaroon, macaroon=macaroon)
+
+        return {**response, "create_macaroon_form": form}
+
+    @view_config(request_method="POST", request_param=DeleteMacaroonForm.__params__)
+    def delete_macaroon(self):
+        form = DeleteMacaroonForm(
+            **self.request.POST, macaroon_service=self.macaroon_service
+        )
+
+        if form.validate():
+            description = self.macaroon_service.find_macaroon(
+                form.macaroon_id.data
+            ).description
+            self.macaroon_service.delete_macaroon(form.macaroon_id.data)
+            self.request.session.flash(
+                f"Deleted API token '{description}'.", queue="success"
+            )
+
+        redirect_to = self.request.referer
+        if not is_safe_url(redirect_to, host=self.request.host):
+            redirect_to = self.request.route_path("manage.account")
+        return HTTPSeeOther(redirect_to)
 
 
 @view_config(
